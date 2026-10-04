@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/codependentai/resonant/releases/latest"><img src="https://img.shields.io/github/v/release/codependentai/resonant?color=5eaba5" alt="Release" /></a>
+  <a href="https://github.com/nekyialabs/resonant/releases/latest"><img src="https://img.shields.io/github/v/release/codependentai/resonant?color=5eaba5" alt="Release" /></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License" /></a>
   <a href="https://docs.anthropic.com/en/api/agent-sdk"><img src="https://img.shields.io/badge/Built_with-Claude_Agent_SDK-6366f1.svg" alt="Built with Claude" /></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.7-3178c6.svg" alt="TypeScript" /></a>
@@ -111,7 +111,7 @@ You'll also use a **terminal** (the text-command window: Terminal on macOS/Linux
 **1. Download the code and install its dependencies.**
 
 ```bash
-git clone https://github.com/codependentai/resonant.git
+git clone https://github.com/nekyialabs/resonant.git
 cd resonant          # move into the folder you just downloaded
 npm install          # download the libraries the app needs (takes a minute)
 ```

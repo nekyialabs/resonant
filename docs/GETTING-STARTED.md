@@ -109,7 +109,7 @@ Now we download Resonant itself onto your computer.
 **Step 1 — download the project.** In your terminal, run:
 
 ```bash
-git clone https://github.com/codependentai/resonant.git
+git clone https://github.com/nekyialabs/resonant.git
 ```
 
 This copies the whole project into a new folder called `resonant`.

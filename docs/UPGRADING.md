@@ -68,7 +68,7 @@ Tuck that `data-backup-v2.3` folder somewhere safe. You now have a full copy of 
 Get the v3 code into a *new* folder, sitting alongside your old one — not on top of it.
 
 ```bash
-git clone https://github.com/codependentai/resonant.git resonant-v3
+git clone https://github.com/nekyialabs/resonant.git resonant-v3
 cd resonant-v3
 npm install
 ```
