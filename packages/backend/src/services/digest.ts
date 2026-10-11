@@ -72,6 +72,113 @@ Do NOT output anything before or after the markdown. No preamble, no "Here's the
 
 const MIN_MESSAGES = 5;
 
+type DigestMessage = { role: string; content: string; created_at: string };
+
+function formatConversation(messages: DigestMessage[]): string {
+  const config = getResonantConfig();
+  const companion = config.identity.companion_name;
+  const user = config.identity.user_name;
+  return messages.map(m => {
+    const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('en-GB', { timeZone: config.identity.timezone, hour: '2-digit', minute: '2-digit' }) : '';
+    const speaker = m.role === 'companion' ? companion : m.role === 'user' ? user : 'System';
+    // Truncate very long messages (tool output, code blocks)
+    const content = m.content.length > 2000 ? m.content.slice(0, 2000) + '\n[... truncated]' : m.content;
+    return `[${time}] ${speaker}: ${content}`;
+  }).join('\n\n');
+}
+
+async function runScribeQuery(prompt: string): Promise<string> {
+  let digestContent = '';
+
+  // Apply user's auth choice (subscription vs api_key) so digest doesn't run
+  // on whatever env state happened to be set by the last agent query.
+  applyAuthToEnv();
+
+  for await (const message of query({
+    prompt,
+    options: {
+      // Pinned to a specific model ID rather than the 'haiku' alias so
+      // subscription and api_key auth resolve to the same model.
+      model: 'claude-haiku-4-5',
+      systemPrompt: buildScribePrompt(),
+      maxTurns: 1,
+      permissionMode: 'plan' as any, // Read-only, no tool use
+      tools: [], // No tools — just generate text
+      // tools:[] does NOT stop the SDK auto-loading the cwd's .mcp.json (~112 tools,
+      // incl. a malformed cloud-discord schema the API 400s on). Must load zero MCP.
+      // (Same fix as services/outlook-author.ts.)
+      strictMcpConfig: true,
+      mcpServers: {},
+      persistSession: false,
+    },
+  })) {
+    if (!message || typeof message !== 'object' || !('type' in message)) continue;
+    const msg = message as any;
+    if (msg.type === 'assistant' && msg.message?.content) {
+      for (const block of msg.message.content) {
+        if (block.type === 'text' && block.text) {
+          digestContent += block.text;
+        }
+      }
+    }
+    // Also capture from result message
+    if (msg.type === 'result' && msg.result) {
+      if (!digestContent) digestContent = msg.result;
+    }
+  }
+
+  return digestContent;
+}
+
+// Message sequences are per-thread (they restart at 1 each day), so the
+// last-processed bookmark is only meaningful together with the thread it
+// belongs to. When the daily thread rolls over, digest whatever remains of
+// the previous thread into that day's file before starting fresh.
+async function flushPreviousThread(threadId: string, lastSeq: number): Promise<void> {
+  const config = getResonantConfig();
+  const messages = getDb().prepare(
+    `SELECT role, content, created_at FROM messages WHERE thread_id = ? AND sequence > ? AND deleted_at IS NULL AND content_type = 'text' ORDER BY sequence ASC`
+  ).all(threadId, lastSeq) as DigestMessage[];
+
+  if (messages.length === 0) {
+    dlog(`Rollover — nothing left to flush from ${threadId}`);
+    return;
+  }
+
+  const dateMatch = threadId.match(/^daily-(\d{4}-\d{2}-\d{2})$/);
+  const date = dateMatch ? dateMatch[1] : (messages[0].created_at || '').slice(0, 10) || today();
+  const lastTime = messages[messages.length - 1].created_at
+    ? new Date(messages[messages.length - 1].created_at).toLocaleTimeString('en-GB', { timeZone: config.identity.timezone, hour: '2-digit', minute: '2-digit' })
+    : nowTime();
+
+  dlog(`Rollover — flushing ${messages.length} remaining messages from ${threadId} (seq ${lastSeq + 1}+)`);
+
+  const companion = config.identity.companion_name;
+  const user = config.identity.user_name;
+  const prompt = `Today is ${date}. This is the final block of that day's conversation, ending at ${lastTime}.
+
+Here is a block of conversation between ${companion} and ${user}:
+
+---
+${formatConversation(messages)}
+---
+
+Write the digest block for this conversation. Remember: output ONLY the markdown, starting with ## ${lastTime} — topic summary`;
+
+  const digestContent = await runScribeQuery(prompt);
+  if (!digestContent.trim()) {
+    dlog('Rollover flush — Haiku returned empty content, skipping');
+    return;
+  }
+
+  const digestPath = join(getDigestsDir(), `${date}.md`);
+  if (!existsSync(digestPath)) {
+    appendFileSync(digestPath, `# Daily Digest — ${date}\n\n`);
+  }
+  appendFileSync(digestPath, digestContent.trim() + '\n\n---\n\n');
+  dlog(`Rollover flush written to ${digestPath} (${digestContent.length} chars)`);
+}
+
 export async function runDigest(agent: AgentService): Promise<void> {
   // Skip if companion is actively processing (don't compete)
   if (agent.isProcessing()) {
@@ -87,8 +194,20 @@ export async function runDigest(agent: AgentService): Promise<void> {
 
   const config = getResonantConfig();
 
-  // Read messages since last digest
-  const lastSeq = parseInt(getConfig('digest.last_sequence') || '0');
+  // Read messages since last digest. Sequences restart at 1 per thread, so
+  // the bookmark is (thread id, sequence) — a bare global sequence goes stale
+  // on day rollover and silently skips the new day (or whole days, if the
+  // previous day was chattier).
+  let lastSeq = parseInt(getConfig('digest.last_sequence') || '0');
+  const lastThreadId = getConfig('digest.last_thread_id');
+  if (lastThreadId && lastThreadId !== thread.id) {
+    try {
+      await flushPreviousThread(lastThreadId, lastSeq);
+    } catch (err: any) {
+      dlog(`Rollover flush error (continuing with today): ${err.message}`);
+    }
+    lastSeq = 0;
+  }
   const messages = getDb().prepare(
     `SELECT role, content, created_at FROM messages WHERE thread_id = ? AND sequence > ? AND deleted_at IS NULL AND content_type = 'text' ORDER BY sequence ASC`
   ).all(thread.id, lastSeq) as Array<{ role: string; content: string; created_at: string }>;
@@ -114,13 +233,7 @@ export async function runDigest(agent: AgentService): Promise<void> {
   const user = config.identity.user_name;
 
   // Format messages for the Scribe
-  const conversationBlock = messages.map(m => {
-    const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('en-GB', { timeZone: config.identity.timezone, hour: '2-digit', minute: '2-digit' }) : '';
-    const speaker = m.role === 'companion' ? companion : m.role === 'user' ? user : 'System';
-    // Truncate very long messages (tool output, code blocks)
-    const content = m.content.length > 2000 ? m.content.slice(0, 2000) + '\n[... truncated]' : m.content;
-    return `[${time}] ${speaker}: ${content}`;
-  }).join('\n\n');
+  const conversationBlock = formatConversation(messages);
 
   const digestsDir = getDigestsDir();
   const digestPath = join(digestsDir, `${today()}.md`);
@@ -137,44 +250,7 @@ ${conversationBlock}
 Write the digest block for this conversation. Remember: output ONLY the markdown, starting with ## ${nowTime()} — topic summary`;
 
   try {
-    let digestContent = '';
-
-    // Apply user's auth choice (subscription vs api_key) so digest doesn't run
-    // on whatever env state happened to be set by the last agent query.
-    applyAuthToEnv();
-
-    for await (const message of query({
-      prompt,
-      options: {
-        // Pinned to a specific model ID rather than the 'haiku' alias so
-        // subscription and api_key auth resolve to the same model.
-        model: 'claude-haiku-4-5',
-        systemPrompt: buildScribePrompt(),
-        maxTurns: 1,
-        permissionMode: 'plan' as any, // Read-only, no tool use
-        tools: [], // No tools — just generate text
-        // tools:[] does NOT stop the SDK auto-loading the cwd's .mcp.json (~112 tools,
-        // incl. a malformed cloud-discord schema the API 400s on). Must load zero MCP.
-        // (Same fix as services/outlook-author.ts.)
-        strictMcpConfig: true,
-        mcpServers: {},
-        persistSession: false,
-      },
-    })) {
-      if (!message || typeof message !== 'object' || !('type' in message)) continue;
-      const msg = message as any;
-      if (msg.type === 'assistant' && msg.message?.content) {
-        for (const block of msg.message.content) {
-          if (block.type === 'text' && block.text) {
-            digestContent += block.text;
-          }
-        }
-      }
-      // Also capture from result message
-      if (msg.type === 'result' && msg.result) {
-        if (!digestContent) digestContent = msg.result;
-      }
-    }
+    const digestContent = await runScribeQuery(prompt);
 
     if (!digestContent.trim()) {
       dlog('Skipped — Haiku returned empty content');
@@ -187,8 +263,9 @@ Write the digest block for this conversation. Remember: output ONLY the markdown
     }
     appendFileSync(digestPath, digestContent.trim() + '\n\n---\n\n');
 
-    // Update last processed sequence
+    // Update last processed position (thread + sequence — see rollover note above)
     setConfig('digest.last_sequence', String(maxSeq.seq));
+    setConfig('digest.last_thread_id', thread.id);
 
     dlog(`Digest written to ${digestPath} (${digestContent.length} chars)`);
   } catch (err: any) {
