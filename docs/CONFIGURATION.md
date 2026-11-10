@@ -300,9 +300,13 @@ falls back to the default shown.
 > access to *additional* places — a notes vault, a project folder — without
 > opening up your whole disk.
 >
-> The write-gate is the real boundary for file writes (symlinks are resolved
-> before the check). The separate Bash guard that blocks commands like
-> `rm -rf /` is a best-effort backstop against accidents, not a security boundary.
+> The write-gate covers the agent's **Write and Edit tools only** (symlinks are
+> resolved before the check; the check-then-write gap is not race-free). It does
+> not gate Bash redirects, `cp`, `tee` and the like. The separate Bash guard that
+> blocks commands like `rm -rf /` is a best-effort backstop for accidents and
+> runaway loops, not a sandbox or a security boundary. Known limit: the Bash
+> session keeps its working directory between calls, and the guard does not track
+> a `cd` made in an earlier call.
 
 ### `voice` — spoken audio
 

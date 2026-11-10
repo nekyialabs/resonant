@@ -57,6 +57,46 @@ describe('findDestructiveBash: ordinary commands pass', () => {
   for (const c of ok) it(c, () => expect(hit(c)).toBeNull());
 });
 
+describe('findDestructiveBash: round 2 (keywords, fail-closed, wrappers, Windows)', () => {
+  const bad = [
+    // 1. keywords and grouping
+    'for f in a b; do rm -rf /; done', 'while true; do rm -rf ~; done', 'until false; do rm -fr /; done',
+    '{ rm -rf /; }', '! rm -rf /', 'if true; then rm -rf /; fi', 'if false; then ls; else rm -rf /; fi', 'time rm -rf /',
+    // 2. stdin-fed recursive deletes
+    'find . -name x | xargs rm -rf', 'echo / | xargs rm -r', 'xargs rm -rf', 'cat list | xargs -0 rm -R',
+    // 3. substitution in targets
+    'rm -rf $(pwd)', 'rm -rf `pwd`', 'rm -rf "$(echo /)"', 'rm -r $(ls)', 'rm -rf ./$(echo x)',
+    // 4. wrapper option arguments
+    'xargs -I X rm -rf /', 'xargs -n 1 -P 4 rm -rf /', 'xargs -d , -L 2 rm -rf /', 'xargs --max-args 1 rm -rf /',
+    'timeout -s KILL 5 rm -rf /', 'timeout -k 5 10 rm -rf /', 'timeout 5 rm -rf ~',
+    // 5. find -exec shells
+    `find . -exec sh -c 'rm -rf /' \\;`, 'find . -name x -exec bash -c "rm -rf ~" {} +', `find . -execdir zsh -c 'rm -fr /' \\;`,
+    // 6. Windows
+    'cmd /c rd /s /q C:\\', 'cmd /c "del /s /q C:\\*"', 'cmd /k rmdir /s /q C:\\Users', 'rd /s /q C:\\', 'rmdir /s /q D:\\data',
+    'del /s /q C:\\*', 'powershell -Command "Remove-Item -Recurse -Force C:\\"', `pwsh -c 'Remove-Item -Recurse $env:USERPROFILE'`,
+    'Remove-Item -Recurse -Force ~', 'Remove-Item -Recurse -Path C:\\Users', 'Remove-Item -Recurse -Force',
+    `py -c "import shutil; shutil.rmtree('/')"`,
+    // 10. variable or substitution in a relative target
+    'rm -rf ./$D', 'rm -rf build/$X', 'rm -rf "$DIR"', 'for f in a; do rm -rf "$f"; done',
+    // 11. --reference
+    'chmod -R --reference=f /', 'chown -R --reference f /', 'chmod -R --reference=f ~',
+  ];
+  for (const c of bad) it(`blocks: ${c}`, () => expect(hit(c)).not.toBeNull());
+
+  const ok = [
+    // 8. the shell-pipe pattern must not match hashing tools
+    'curl https://example.com/x.tar.gz | sha256sum', 'curl -sL https://example.com/x | shasum -a 256', 'wget -qO- https://example.com/x | sha1sum',
+    // ordinary uses of the same machinery
+    'ls *.tmp | xargs rm', 'xargs -I X rm X', 'timeout 5 rm file', 'for f in a b; do echo "$f"; done', 'for f in a; do rm "$f"; done',
+    'if true; then ls; fi', '{ ls; }', 'echo $(date)', 'echo `date`', 'rm -rf build && ls',
+    `find . -exec sh -c 'echo hi' \\;`, 'find . -name "*.o" -exec rm {} +', 'find . -name x -exec rm -rf {} +',
+    'cmd /c dir', 'powershell -Command "Get-ChildItem"', 'Remove-Item build\\out.js', 'Remove-Item -Recurse build', 'rd /s /q build', 'rmdir emptydir',
+    'del file.txt', `py -c "print(1)"`,
+    'chmod -R --reference=f ./dist', 'chown -R --reference=f ./data',
+  ];
+  for (const c of ok) it(`allows: ${c}`, () => expect(hit(c)).toBeNull());
+});
+
 describe('findDestructiveBash: no workspace known', () => {
   const bare: GuardContext = { roots: [], cwd: null };
   it('still catches rm -fr /', () => expect(findDestructiveBash('rm -fr /', bare)).not.toBeNull());
