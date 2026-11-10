@@ -121,7 +121,23 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canvas.title, canvas.content]);
 
-  const flushSave = useCallback(async (content: string) => {
+  // Saves run one after another (the base version is read when each one runs),
+  // so two overlapping saves can't conflict with each other.
+  const saveChain = useRef<Promise<unknown>>(Promise.resolve());
+
+  // The editor is keyed on canvas.id, so a timer left over from this canvas can
+  // never fire against another one.
+  useEffect(() => () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+  }, []);
+
+  function flushSave(content: string): Promise<void> {
+    const run = saveChain.current.then(() => doSave(content));
+    saveChain.current = run.catch(() => undefined);
+    return run;
+  }
+
+  const doSave = async (content: string): Promise<void> => {
     if (conflictRef.current !== null) return;
     setSaving(true);
     try {
@@ -141,7 +157,7 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
     } finally {
       setSaving(false);
     }
-  }, [canvas.id, onSaved]);
+  };
 
   async function fetchLatest(): Promise<CanvasFull | null> {
     try {
@@ -181,6 +197,7 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
     setIsDirty(true);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
+      saveTimer.current = null;
       flushSave(value);
     }, 500);
   }
@@ -205,6 +222,7 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
     // Flush pending save before entering preview
     if (editMode && saveTimer.current) {
       clearTimeout(saveTimer.current);
+      saveTimer.current = null;
       flushSave(localContent);
     }
     setEditMode(m => !m);
@@ -740,6 +758,7 @@ export function CanvasView() {
       {/* Right: editor or empty state */}
       {activeCanvas && !loadingFull ? (
         <CanvasEditor
+          key={activeCanvas.id}
           canvas={activeCanvas}
           onSaved={handleSaved}
           onDeleted={handleDeleted}

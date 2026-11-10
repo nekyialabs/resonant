@@ -1013,6 +1013,13 @@ function handleCanvasUpdate(
     return;
   }
 
+  // undefined = legacy client (unconditional write); otherwise it must be a
+  // non-negative integer. Anything else is a bug in the client — say so.
+  if (msg.baseVersion !== undefined && !(Number.isInteger(msg.baseVersion) && msg.baseVersion >= 0)) {
+    sendError(ws, 'invalid_base_version', 'baseVersion must be a non-negative integer');
+    return;
+  }
+
   const now = new Date().toISOString();
   // baseVersion is the version the client loaded. Absent = legacy client,
   // unconditional write (still bumps the version).

@@ -139,12 +139,19 @@ switch (cmd) {
     } else if (sub === 'update') {
       // Optional guard: --base-version N (the version printed by `canvas read`).
       // A stale version is refused and nothing is written.
-      const bv = args.indexOf('--base-version');
-      const body = { action: 'update', canvasId: args[1], filePath: args[2] };
+      // The flag may appear anywhere, so pull it out before reading positionals.
+      const rest = args.slice(1);
+      const bv = rest.indexOf('--base-version');
+      let baseVersionArg;
       if (bv !== -1) {
-        const n = Number(args[bv + 1]);
-        if (!Number.isInteger(n)) {
-          console.error('Error: --base-version needs an integer');
+        baseVersionArg = rest[bv + 1];
+        rest.splice(bv, 2);
+      }
+      const body = { action: 'update', canvasId: rest[0], filePath: rest[1] };
+      if (bv !== -1) {
+        const n = Number(baseVersionArg);
+        if (baseVersionArg === undefined || baseVersionArg === '' || !Number.isInteger(n) || n < 0) {
+          console.error('Error: --base-version needs a non-negative integer');
           process.exitCode = 1;
           break;
         }

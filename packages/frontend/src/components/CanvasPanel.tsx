@@ -172,6 +172,13 @@ function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
 
   // Save content against the version this edit was based on; on a conflict keep
   // the user's text and stop autosaving until they decide what to do.
+  // A pending debounced save must never outlive this canvas: the component is
+  // keyed on canvas.id, so unmount covers a canvas switch too.
+  useEffect(() => () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    if (copyTimer.current) clearTimeout(copyTimer.current);
+  }, []);
+
   const commit = useCallback(async (patch: Partial<Pick<Canvas, 'title' | 'content'>>) => {
     if (conflictRef.current !== null) return;
     const res = await onUpdate(canvas.id, patch, () => baseVersionRef.current);
@@ -217,17 +224,23 @@ function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
       // Leaving edit — flush any pending save
       if (saveTimer.current) {
         clearTimeout(saveTimer.current);
-        void commit({ content: editContent, title: editTitle.trim() || canvas.title });
+        saveTimer.current = null;
+        void commit({ content: editContent });
       }
+      // Title travels on its own request: it is not version-guarded, so a stale
+      // content save can never drop it.
+      const title = editTitle.trim() || canvas.title;
+      if (title !== canvas.title) void onUpdate(canvas.id, { title });
     }
     setEditMode(m => !m);
-  }, [editMode, editContent, editTitle, canvas.id, canvas.title, commit]);
+  }, [editMode, editContent, editTitle, canvas.id, canvas.title, commit, onUpdate]);
 
   const handleContentChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     setEditContent(value);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
+      saveTimer.current = null;
       setSaving(true);
       try { await commit({ content: value }); }
       finally { setSaving(false); }
@@ -899,6 +912,7 @@ export function CanvasPanel() {
     >
       {canvas ? (
         <CanvasPanelInner
+          key={canvas.id}
           canvas={canvas}
           onClose={closeCanvas}
           onUpdate={updateCanvas}

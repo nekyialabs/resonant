@@ -464,8 +464,8 @@ router.post('/internal/canvas', internalOnly, (req, res) => {
         res.status(400).json({ error: 'canvasId and content (or filePath) are required' });
         return;
       }
-      if (baseVersion !== undefined && !Number.isInteger(baseVersion)) {
-        res.status(400).json({ error: 'baseVersion must be an integer' });
+      if (baseVersion !== undefined && !(Number.isInteger(baseVersion) && baseVersion >= 0)) {
+        res.status(400).json({ error: 'baseVersion must be a non-negative integer' });
         return;
       }
       // This is a full-content write, so a "retry on top of latest" would
@@ -3580,8 +3580,12 @@ router.patch('/canvases/:id', (req, res) => {
     const now = new Date().toISOString();
     const { title, content, version } = req.body;
 
-    if (version !== undefined && !Number.isInteger(version)) {
-      res.status(400).json({ error: 'version must be an integer' });
+    if (version !== undefined && !(Number.isInteger(version) && version >= 0)) {
+      res.status(400).json({ error: 'version must be a non-negative integer' });
+      return;
+    }
+    if (version !== undefined && content === undefined) {
+      res.status(400).json({ error: 'version is only meaningful together with content' });
       return;
     }
 
