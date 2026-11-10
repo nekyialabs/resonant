@@ -14,6 +14,11 @@ import type {
 
 export type ConnectionState = 'connected' | 'disconnecting' | 'disconnected' | 'reconnecting';
 
+export type CanvasSaveResult =
+  | { status: 'saved'; version: number }
+  | { status: 'conflict'; canvas: Canvas }
+  | { status: 'failed' };
+
 export interface ToolEvent {
   toolId: string;
   toolName: string;
@@ -130,6 +135,10 @@ interface ChatStore {
 
   // Canvas panel
   threadCanvases: Canvas[];
+  /** Unsaved text whose save was refused as stale after its editor had already
+   *  closed. Reopening that canvas shows it in the conflict notice. */
+  canvasDrafts: Record<string, string>;
+  setCanvasDraft: (id: string, text: string | null) => void;
   openCanvasId: string | null;
 
   // Context usage (from context_usage server events)
@@ -145,7 +154,12 @@ interface ChatStore {
   clearTranscription: () => void;
   openCanvas: (id: string) => void;
   closeCanvas: () => void;
-  updateCanvas: (id: string, patch: Partial<Pick<Canvas, 'title' | 'content'>>) => Promise<void>;
+  /** baseVersion = the canvas version the edit was based on (a number, or a
+   *  getter evaluated when the save actually runs; defaults to the
+   *  store's current copy). Resolves 'conflict' when someone else saved first;
+   *  the store then holds the latest server copy and the caller still has the
+   *  user's text, so nothing is lost. */
+  updateCanvas: (id: string, patch: Partial<Pick<Canvas, 'title' | 'content'>>, baseVersion?: number | (() => number | undefined)) => Promise<CanvasSaveResult>;
   // Thread management
   renameThread: (id: string, name: string) => Promise<void>;
   archiveThread: (id: string) => Promise<void>;
@@ -813,11 +827,30 @@ export const useChatStore = create<ChatStore>((set, get) => {
               ...c,
               content: m.content,
               updated_at: m.updatedAt,
+              // max(): our own save's broadcast can arrive after a newer response
+              version: Math.max(c.version ?? 0, m.version ?? 0),
               ...(m.title !== undefined ? { title: m.title } : {}),
             };
           });
           return { threadCanvases: next };
         });
+        break;
+      }
+
+      case 'canvas_saved': {
+        set(s => ({
+          threadCanvases: s.threadCanvases.map(c =>
+            c.id === m.canvasId ? { ...c, version: Math.max(c.version ?? 0, m.version) } : c
+          ),
+        }));
+        break;
+      }
+
+      case 'canvas_conflict': {
+        // A WS save was refused as stale: adopt the server's latest copy.
+        set(s => ({
+          threadCanvases: s.threadCanvases.map(c => (c.id === m.canvasId ? m.canvas : c)),
+        }));
         break;
       }
 
@@ -1235,8 +1268,32 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
   // ─── Canvas panel actions ────────────────────────────────────────────────────
 
-  async function updateCanvas(id: string, patch: Partial<Pick<Canvas, 'title' | 'content'>>) {
+  // Saves for one canvas run strictly one after another, so a debounced save
+  // never goes out with a version that the previous (still in flight) save is
+  // about to make stale — that would conflict with ourselves.
+  const canvasSaveQueue = new Map<string, Promise<unknown>>();
+
+  function updateCanvas(
+    id: string,
+    patch: Partial<Pick<Canvas, 'title' | 'content'>>,
+    baseVersion?: number | (() => number | undefined),
+  ): Promise<CanvasSaveResult> {
+    const prev = canvasSaveQueue.get(id) ?? Promise.resolve();
+    const run = prev.then(() => doUpdateCanvas(id, patch, baseVersion));
+    canvasSaveQueue.set(id, run.catch(() => undefined));
+    return run;
+  }
+
+  async function doUpdateCanvas(
+    id: string,
+    patch: Partial<Pick<Canvas, 'title' | 'content'>>,
+    baseVersion?: number | (() => number | undefined),
+  ): Promise<CanvasSaveResult> {
     const prevCanvases = get().threadCanvases;
+    // A title-only change carries no version: the guard is on content.
+    const version = patch.content !== undefined
+      ? (typeof baseVersion === 'function' ? baseVersion() : baseVersion) ?? prevCanvases.find(c => c.id === id)?.version
+      : undefined;
     // Optimistic
     set(s => ({
       threadCanvases: s.threadCanvases.map(c =>
@@ -1244,14 +1301,30 @@ export const useChatStore = create<ChatStore>((set, get) => {
       ),
     }));
     try {
-      await okFetch(`${BASE_STORE}/api/canvases/${id}`, {
+      const res = await fetch(`${BASE_STORE}/api/canvases/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
+        body: JSON.stringify(version !== undefined ? { ...patch, version } : patch),
       });
-      // WS canvas_updated broadcast reconciles
+      if (res.status === 409) {
+        const body = await res.json() as { canvas: Canvas };
+        set(s => ({
+          threadCanvases: s.threadCanvases.map(c => (c.id === id ? body.canvas : c)),
+        }));
+        return { status: 'conflict', canvas: body.canvas };
+      }
+      if (!res.ok) throw new Error(`PATCH /api/canvases/${id} → HTTP ${res.status}`);
+      const body = await res.json() as { version?: number };
+      const newVersion = body.version ?? version ?? 0;
+      set(s => ({
+        threadCanvases: s.threadCanvases.map(c =>
+          c.id === id ? { ...c, version: Math.max(c.version ?? 0, newVersion) } : c
+        ),
+      }));
+      return { status: 'saved', version: newVersion };
     } catch (err) {
       failMutation('Update canvas', err, () => set({ threadCanvases: prevCanvases }));
+      return { status: 'failed' };
     }
   }
 
@@ -1304,6 +1377,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
     transcription: { status: 'idle', text: null, error: null },
 
     threadCanvases: [],
+    canvasDrafts: {},
+    setCanvasDraft: (id, text) => set(s => {
+      const next = { ...s.canvasDrafts };
+      if (text === null) delete next[id]; else next[id] = text;
+      return { canvasDrafts: next };
+    }),
     openCanvasId: null,
 
     contextUsage: null,

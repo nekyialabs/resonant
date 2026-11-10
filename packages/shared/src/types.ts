@@ -189,6 +189,9 @@ export interface Canvas {
   created_by: 'companion' | 'user';
   created_at: string;
   updated_at: string;
+  /** Optimistic-concurrency counter. Starts at 0, +1 on every content write.
+   *  Clients send the version they loaded; a stale one is refused (409). */
+  version: number;
 }
 
 export type MessageSegment =

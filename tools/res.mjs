@@ -137,9 +137,31 @@ switch (cmd) {
         contentType: args[3] || 'markdown', threadId: thread,
       });
     } else if (sub === 'update') {
-      await post('canvas', { action: 'update', canvasId: args[1], filePath: args[2] });
+      // Optional guard: --base-version N (the version printed by `canvas read`).
+      // A stale version is refused and nothing is written.
+      // The flag may appear anywhere, so pull it out before reading positionals.
+      const rest = args.slice(1);
+      const bv = rest.indexOf('--base-version');
+      let baseVersionArg;
+      if (bv !== -1) {
+        baseVersionArg = rest[bv + 1];
+        rest.splice(bv, 2);
+      }
+      const body = { action: 'update', canvasId: rest[0], filePath: rest[1] };
+      if (bv !== -1) {
+        const n = Number(baseVersionArg);
+        if (baseVersionArg === undefined || baseVersionArg === '' || !Number.isInteger(n) || n < 0) {
+          console.error('Error: --base-version needs a non-negative integer');
+          process.exitCode = 1;
+          break;
+        }
+        body.baseVersion = n;
+      }
+      await post('canvas', body);
+    } else if (sub === 'read') {
+      await post('canvas', { action: 'read', canvasId: args[1] });
     } else {
-      console.log('Usage: res canvas create|create-inline|update ...');
+      console.log('Usage: res canvas create|create-inline|read|update ...');
     }
     break;
   }

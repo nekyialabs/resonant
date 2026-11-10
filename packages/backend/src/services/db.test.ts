@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 // Mock embeddings to avoid loading HuggingFace ML model
 vi.mock('./embeddings.js', () => ({
@@ -41,6 +44,7 @@ import {
   getCanvas,
   listCanvases,
   deleteCanvas,
+  updateCanvasContent,
   createTimer,
   listPendingTimers,
   cancelTimer,
@@ -331,6 +335,90 @@ describe('Canvas operations', () => {
 
   it('returns false deleting non-existent canvas', () => {
     expect(deleteCanvas('nope')).toBe(false);
+  });
+});
+
+describe('Canvas optimistic concurrency', () => {
+  const mk = (id = 'cv-v') =>
+    createCanvas({ id, title: 'V', content: 'v0 text', contentType: 'text', createdBy: 'user', createdAt: new Date().toISOString() });
+
+  it('starts at version 0', () => {
+    expect(mk().version).toBe(0);
+  });
+
+  it('accepts a write at the current version and increments it', () => {
+    mk();
+    const r1 = updateCanvasContent('cv-v', 'one', new Date().toISOString(), 0);
+    expect(r1).toEqual({ ok: true, version: 1 });
+    const r2 = updateCanvasContent('cv-v', 'two', new Date().toISOString(), 1);
+    expect(r2).toEqual({ ok: true, version: 2 });
+    expect(getCanvas('cv-v')).toMatchObject({ content: 'two', version: 2 });
+  });
+
+  it('refuses a stale version, writes nothing, and returns the current canvas', () => {
+    mk();
+    updateCanvasContent('cv-v', 'agent edit', new Date().toISOString(), 0); // wins the race
+    const stale = updateCanvasContent('cv-v', 'human edit', new Date().toISOString(), 0);
+    expect(stale.ok).toBe(false);
+    if (!stale.ok && stale.reason === 'conflict') {
+      expect(stale.canvas.content).toBe('agent edit');
+      expect(stale.canvas.version).toBe(1);
+    } else {
+      throw new Error('expected a conflict');
+    }
+    expect(getCanvas('cv-v')).toMatchObject({ content: 'agent edit', version: 1 });
+  });
+
+  it('refuses a version from the future too', () => {
+    mk();
+    expect(updateCanvasContent('cv-v', 'x', new Date().toISOString(), 5).ok).toBe(false);
+    expect(getCanvas('cv-v')!.content).toBe('v0 text');
+  });
+
+  it('legacy write without a version is unconditional but still bumps the version', () => {
+    mk();
+    const r = updateCanvasContent('cv-v', 'legacy', new Date().toISOString());
+    expect(r).toEqual({ ok: true, version: 1 });
+    // a versioned writer that loaded version 0 is now refused
+    expect(updateCanvasContent('cv-v', 'stale', new Date().toISOString(), 0).ok).toBe(false);
+    expect(getCanvas('cv-v')!.content).toBe('legacy');
+  });
+
+  it('reports not_found for a missing canvas', () => {
+    expect(updateCanvasContent('nope', 'x', new Date().toISOString(), 0)).toEqual({ ok: false, reason: 'not_found' });
+    expect(updateCanvasContent('nope', 'x', new Date().toISOString())).toEqual({ ok: false, reason: 'not_found' });
+  });
+
+  it('title updates do not change the content version', () => {
+    mk();
+    getDb().prepare('UPDATE canvases SET title = ? WHERE id = ?').run('renamed', 'cv-v');
+    expect(getCanvas('cv-v')!.version).toBe(0);
+  });
+
+  it('migrates an existing database that has no version column', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resonant-canvas-mig-'));
+    const file = join(dir, 'old.db');
+    try {
+      initDb(file);
+      createCanvas({ id: 'old-1', title: 'Old', content: 'kept', contentType: 'text', createdBy: 'user', createdAt: new Date().toISOString() });
+      // Simulate a pre-version database.
+      getDb().exec('ALTER TABLE canvases DROP COLUMN version');
+      getDb().close();
+
+      initDb(file); // migration runs on the existing data
+      const migrated = getCanvas('old-1')!;
+      expect(migrated.content).toBe('kept');
+      expect(migrated.version).toBe(0);
+      expect(updateCanvasContent('old-1', 'new', new Date().toISOString(), 0)).toEqual({ ok: true, version: 1 });
+
+      getDb().close();
+      initDb(file); // idempotent on a DB that already has the column
+      expect(getCanvas('old-1')!.version).toBe(1);
+    } finally {
+      try { getDb().close(); } catch { /* already closed */ }
+      initDb(':memory:');
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
