@@ -22,6 +22,7 @@ import React, {
 import type { Canvas } from '@resonant/shared';
 import { renderMarkdown } from '../utils/markdown';
 import { useChatStore } from '../store/chat';
+import type { CanvasSaveResult } from '../store/chat';
 
 // ─── Resize persistence ────────────────────────────────────────────────────────
 
@@ -124,7 +125,11 @@ function CanvasReadBody({ canvas }: { canvas: Canvas }) {
 interface CanvasPanelProps {
   canvas: Canvas;
   onClose: () => void;
-  onUpdate: (id: string, patch: Partial<Pick<Canvas, 'title' | 'content'>>) => Promise<void>;
+  onUpdate: (
+    id: string,
+    patch: Partial<Pick<Canvas, 'title' | 'content'>>,
+    baseVersion?: number | (() => number | undefined),
+  ) => Promise<CanvasSaveResult>;
 }
 
 function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
@@ -133,6 +138,25 @@ function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
   const [editTitle, setEditTitle] = useState(canvas.title);
   const [copyFlash, setCopyFlash] = useState(false);
   const [saving, setSaving] = useState(false);
+  // The canvas version this edit session is based on. Not simply canvas.version:
+  // if the companion saves while we are typing, canvas.version moves on but our
+  // text is still based on the older one — that is exactly the conflict to catch.
+  const baseVersionRef = useRef(canvas.version ?? 0);
+  // Set when a save was refused because someone else saved first. Holds the
+  // user's unsaved text so it can be copied or re-applied; autosave is paused
+  // until they choose.
+  // A draft left behind by an earlier instance of this canvas (flush refused
+  // after its editor closed) reappears as the conflict notice.
+  const [conflictMine, setConflictMine] = useState<string | null>(() => {
+    const draft = useChatStore.getState().canvasDrafts[canvas.id];
+    if (draft !== undefined) useChatStore.getState().setCanvasDraft(canvas.id, null);
+    return draft ?? null;
+  });
+  const conflictRef = useRef<string | null>(null);
+  const unmountedRef = useRef(false);
+  const pendingContentRef = useRef<string | null>(null);
+  const commitRef = useRef<(patch: Partial<Pick<Canvas, 'title' | 'content'>>) => Promise<void>>(async () => {});
+  conflictRef.current = conflictMine;
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -141,16 +165,76 @@ function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
     if (!editMode) {
       setEditContent(canvas.content);
       setEditTitle(canvas.title);
+      baseVersionRef.current = canvas.version ?? 0;
     }
-  }, [canvas.id, canvas.content, canvas.title, editMode]);
+  }, [canvas.id, canvas.content, canvas.title, canvas.version, editMode]);
 
   // Reset edit state when canvas id changes
   useEffect(() => {
     setEditMode(false);
     setEditContent(canvas.content);
     setEditTitle(canvas.title);
+    baseVersionRef.current = canvas.version ?? 0;
+    setConflictMine(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canvas.id]);
+
+  // Save content against the version this edit was based on; on a conflict keep
+  // the user's text and stop autosaving until they decide what to do.
+  // Leaving this canvas (the component is keyed on canvas.id, so a switch is an
+  // unmount) must not lose text: a pending debounced save is fired now, through
+  // the same store queue and with this instance's own id and base version. If it
+  // is refused, the text goes to the store as a draft (see commit below).
+  useEffect(() => () => {
+    unmountedRef.current = true;
+    if (copyTimer.current) clearTimeout(copyTimer.current);
+    if (conflictRef.current !== null) {
+      // A conflict notice is showing: keep its text for when the canvas reopens.
+      useChatStore.getState().setCanvasDraft(canvas.id, conflictRef.current);
+    } else if (saveTimer.current && pendingContentRef.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+      void commitRef.current({ content: pendingContentRef.current });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const commit = useCallback(async (patch: Partial<Pick<Canvas, 'title' | 'content'>>) => {
+    if (conflictRef.current !== null) return;
+    const res = await onUpdate(canvas.id, patch, () => baseVersionRef.current);
+    if (res.status === 'saved') {
+      baseVersionRef.current = res.version;
+    } else if (res.status === 'conflict' && patch.content !== undefined) {
+      if (unmountedRef.current) {
+        // The editor is gone and can't show the notice: keep the text for later.
+        useChatStore.getState().setCanvasDraft(canvas.id, patch.content);
+      } else {
+        setConflictMine(patch.content);
+      }
+    }
+  }, [canvas.id, onUpdate]);
+  commitRef.current = commit;
+
+  const handleConflictCopy = useCallback(async () => {
+    try { await navigator.clipboard.writeText(conflictRef.current ?? ''); } catch { /* clipboard denied */ }
+  }, []);
+
+  const handleConflictKeepMine = useCallback(async () => {
+    const mine = conflictRef.current;
+    if (mine === null) return;
+    // Deliberate overwrite: rebase onto the latest version, then save our text.
+    baseVersionRef.current = canvas.version ?? 0;
+    setConflictMine(null);
+    conflictRef.current = null;
+    setEditContent(mine);
+    await commit({ content: mine });
+  }, [canvas.version, commit]);
+
+  const handleConflictUseLatest = useCallback(() => {
+    baseVersionRef.current = canvas.version ?? 0;
+    setEditContent(canvas.content);
+    setConflictMine(null);
+  }, [canvas.version, canvas.content]);
 
   const handleCopy = useCallback(async () => {
     try {
@@ -166,22 +250,29 @@ function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
       // Leaving edit — flush any pending save
       if (saveTimer.current) {
         clearTimeout(saveTimer.current);
-        void onUpdate(canvas.id, { content: editContent, title: editTitle.trim() || canvas.title });
+        saveTimer.current = null;
+        void commit({ content: editContent });
       }
+      // Title travels on its own request: it is not version-guarded, so a stale
+      // content save can never drop it.
+      const title = editTitle.trim() || canvas.title;
+      if (title !== canvas.title) void onUpdate(canvas.id, { title });
     }
     setEditMode(m => !m);
-  }, [editMode, editContent, editTitle, canvas.id, canvas.title, onUpdate]);
+  }, [editMode, editContent, editTitle, canvas.id, canvas.title, commit, onUpdate]);
 
   const handleContentChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     setEditContent(value);
+    pendingContentRef.current = value;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
+      saveTimer.current = null;
       setSaving(true);
-      try { await onUpdate(canvas.id, { content: value }); }
+      try { await commit({ content: value }); }
       finally { setSaving(false); }
     }, 600);
-  }, [canvas.id, onUpdate]);
+  }, [commit]);
 
   const handleTitleBlur = useCallback(async () => {
     const trimmed = editTitle.trim() || canvas.title;
@@ -264,6 +355,24 @@ function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
           </button>
         </div>
       </div>
+
+      {conflictMine !== null && (
+        <div className="cpanel-conflict" role="alert">
+          <p className="cpanel-conflict-msg">
+            This canvas was changed somewhere else while you were editing, so your last edit was
+            not saved. Your text is kept here until you decide.
+          </p>
+          <details className="cpanel-conflict-mine">
+            <summary>Your unsaved text</summary>
+            <textarea readOnly value={conflictMine} aria-label="Your unsaved text" />
+          </details>
+          <div className="cpanel-conflict-actions">
+            <button type="button" className="cpanel-btn" onClick={handleConflictCopy}>Copy my text</button>
+            <button type="button" className="cpanel-btn" onClick={handleConflictKeepMine}>Replace latest with mine</button>
+            <button type="button" className="cpanel-btn" onClick={handleConflictUseLatest}>Use latest, drop mine</button>
+          </div>
+        </div>
+      )}
 
       {/* Body */}
       <div className="cpanel-body">
@@ -617,6 +726,34 @@ function CanvasPanelInner({ canvas, onClose, onUpdate }: CanvasPanelProps) {
         }
 
         /* ── Save indicator ── */
+        .cpanel-conflict {
+          flex-shrink: 0;
+          padding: 0.625rem 0.875rem;
+          border-bottom: 1px solid rgba(201, 168, 124, 0.18);
+          background: rgba(201, 140, 90, 0.10);
+          font-size: 0.8125rem;
+          color: var(--text-primary, #e8e0d4);
+        }
+        .cpanel-conflict-msg { margin: 0 0 0.5rem; }
+        .cpanel-conflict-mine textarea {
+          width: 100%;
+          min-height: 6rem;
+          margin-top: 0.375rem;
+          font-family: var(--font-mono, 'JetBrains Mono', monospace);
+          font-size: 0.75rem;
+          background: rgba(0, 0, 0, 0.2);
+          color: inherit;
+          border: 1px solid rgba(201, 168, 124, 0.15);
+          border-radius: 4px;
+        }
+        .cpanel-conflict-actions .cpanel-btn { width: auto; height: auto; padding: 0.25rem 0.625rem; }
+        .cpanel-conflict-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.5rem;
+          margin-top: 0.5rem;
+        }
+
         .cpanel-save-indicator {
           position: absolute;
           bottom: 0.5rem;
@@ -802,6 +939,7 @@ export function CanvasPanel() {
     >
       {canvas ? (
         <CanvasPanelInner
+          key={canvas.id}
           canvas={canvas}
           onClose={closeCanvas}
           onUpdate={updateCanvas}

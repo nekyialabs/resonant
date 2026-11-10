@@ -31,7 +31,7 @@ export type ClientMessage =
   | { type: 'ping' }
   | { type: 'request_status' }
   | { type: 'canvas_create'; title: string; contentType: 'markdown' | 'code' | 'text' | 'html'; language?: string; threadId?: string }
-  | { type: 'canvas_update'; canvasId: string; content: string }
+  | { type: 'canvas_update'; canvasId: string; content: string; baseVersion?: number }
   | { type: 'canvas_update_title'; canvasId: string; title: string }
   | { type: 'canvas_delete'; canvasId: string }
   | { type: 'canvas_list' }
@@ -79,7 +79,9 @@ export type ServerMessage =
   | { type: 'context_usage'; percentage: number; tokensUsed: number; contextWindow: number }
   | { type: 'compaction_notice'; preTokens: number; message: string; isComplete: boolean }
   | { type: 'canvas_created'; canvas: Canvas }
-  | { type: 'canvas_updated'; canvasId: string; content: string; updatedAt: string; title?: string }
+  | { type: 'canvas_updated'; canvasId: string; content: string; updatedAt: string; version?: number; title?: string }
+  | { type: 'canvas_saved'; canvasId: string; version: number }
+  | { type: 'canvas_conflict'; canvasId: string; canvas: Canvas }
   | { type: 'canvas_deleted'; canvasId: string }
   | { type: 'canvas_list'; canvases: Canvas[] }
   | { type: 'thinking'; id: string; content: string; summary: string; textOffset: number; isComplete: boolean }

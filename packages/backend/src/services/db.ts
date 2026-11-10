@@ -208,6 +208,15 @@ export function initDb(dbPath: string): Database.Database {
     // Column already exists — fine
   }
 
+  // Canvas optimistic-concurrency migration. Every content write bumps version;
+  // writers that send the version they loaded are refused if it is stale.
+  // Existing rows get 0 via the column default.
+  try {
+    db.exec(`ALTER TABLE canvases ADD COLUMN version INTEGER NOT NULL DEFAULT 0`);
+  } catch {
+    // Column already exists — fine
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS discord_pairings (
       code TEXT PRIMARY KEY,
@@ -1527,7 +1536,11 @@ export function createCanvas(params: {
 // shared Canvas contract (message_id required) always holds.
 function rowToCanvas(row: Record<string, unknown>): Canvas {
   const c = row as unknown as Canvas;
-  return { ...c, message_id: (c.message_id ?? null) as string | null };
+  return {
+    ...c,
+    message_id: (c.message_id ?? null) as string | null,
+    version: typeof c.version === 'number' ? c.version : 0,
+  };
 }
 
 export function getCanvas(id: string): Canvas | null {
@@ -1548,9 +1561,41 @@ export function listCanvasesByThread(threadId: string): Canvas[] {
   return (stmt.all(threadId) as Record<string, unknown>[]).map(rowToCanvas);
 }
 
-export function updateCanvasContent(id: string, content: string, updatedAt: string): void {
-  const stmt = getDb().prepare('UPDATE canvases SET content = ?, updated_at = ? WHERE id = ?');
-  stmt.run(content, updatedAt, id);
+export type CanvasWriteResult =
+  | { ok: true; version: number }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'conflict'; canvas: Canvas };
+
+/**
+ * Write canvas content with optimistic concurrency.
+ *
+ * With expectedVersion: the write lands only if the canvas is still at that
+ * version (UPDATE ... WHERE id = ? AND version = ?, changes === 1). A stale
+ * version is refused and the current canvas is returned so the caller can
+ * reload without losing the loser's text.
+ *
+ * Without expectedVersion (legacy callers that predate versions): the write is
+ * unconditional, last-write-wins as before, but it still bumps the version so
+ * any versioned writer holding the old copy is refused rather than clobbering.
+ */
+export function updateCanvasContent(
+  id: string,
+  content: string,
+  updatedAt: string,
+  expectedVersion?: number,
+): CanvasWriteResult {
+  const db = getDb();
+  const result = expectedVersion === undefined
+    ? db.prepare('UPDATE canvases SET content = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+        .run(content, updatedAt, id)
+    : db.prepare('UPDATE canvases SET content = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+        .run(content, updatedAt, id, expectedVersion);
+  if (result.changes === 1) {
+    return { ok: true, version: getCanvas(id)!.version };
+  }
+  const current = getCanvas(id);
+  if (!current) return { ok: false, reason: 'not_found' };
+  return { ok: false, reason: 'conflict', canvas: current };
 }
 
 export function updateCanvasTitle(id: string, title: string, updatedAt: string): void {

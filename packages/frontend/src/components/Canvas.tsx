@@ -30,6 +30,7 @@ const BASE = import.meta.env.DEV ? 'http://127.0.0.1:3099' : '';
 
 interface CanvasFull extends CanvasMeta {
   content: string;
+  version?: number;
   language?: string;
 }
 
@@ -40,8 +41,12 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw new HttpError(res.status, `${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
+}
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
 }
 
 // ─── SVGs ──────────────────────────────────────────────────────────────────────
@@ -73,6 +78,10 @@ function IconTrash() {
   );
 }
 
+// Text whose save was refused as stale after its editor had already closed.
+// Reopening that canvas shows it in the conflict notice instead of losing it.
+const conflictDrafts = new Map<string, string>();
+
 // ─── CanvasEditor ──────────────────────────────────────────────────────────────
 
 interface CanvasEditorProps {
@@ -89,6 +98,19 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
   const [editMode, setEditMode] = useState(true);
   const [saving, setSaving] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Version this edit session is based on (sent with every save so a save made
+  // after someone else changed the canvas is refused instead of overwriting).
+  const baseVersionRef = useRef(canvas.version ?? 0);
+  // Unsaved text kept after a refused save; autosave is paused while set.
+  const [conflictMine, setConflictMine] = useState<string | null>(() => {
+    const draft = conflictDrafts.get(canvas.id);
+    conflictDrafts.delete(canvas.id);
+    return draft ?? null;
+  });
+  const conflictRef = useRef<string | null>(null);
+  const unmountedRef = useRef(false);
+  const pendingContentRef = useRef<string | null>(null);
+  conflictRef.current = conflictMine;
 
   // When canvas id changes, sync from fresh fetch result
   useEffect(() => {
@@ -96,6 +118,8 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
     setLocalContent(canvas.content);
     setIsDirty(false);
     setEditMode(true);
+    baseVersionRef.current = canvas.version ?? 0;
+    setConflictMine(null);
   }, [canvas.id]);
 
   // If parent refreshes the canvas record (not an id switch), pull non-dirty fields
@@ -107,28 +131,98 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canvas.title, canvas.content]);
 
-  const flushSave = useCallback(async (content: string) => {
+  // Saves run one after another (the base version is read when each one runs),
+  // so two overlapping saves can't conflict with each other.
+  const saveChain = useRef<Promise<unknown>>(Promise.resolve());
+
+  // The editor is keyed on canvas.id, so a timer left over from this canvas can
+  // never fire against another one.
+  // On leaving, a pending save is flushed (same chain, this instance's id and
+  // base version) rather than dropped; a refused one is kept as a draft.
+  useEffect(() => () => {
+    unmountedRef.current = true;
+    if (conflictRef.current !== null) {
+      conflictDrafts.set(canvas.id, conflictRef.current);
+    } else if (saveTimer.current && pendingContentRef.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+      void flushSaveRef.current(pendingContentRef.current);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const flushSaveRef = useRef<(c: string) => Promise<void>>(async () => {});
+  function flushSave(content: string): Promise<void> {
+    const run = saveChain.current.then(() => doSave(content));
+    saveChain.current = run.catch(() => undefined);
+    return run;
+  }
+
+  flushSaveRef.current = flushSave;
+
+  const doSave = async (content: string): Promise<void> => {
+    if (conflictRef.current !== null) return;
     setSaving(true);
     try {
-      await apiFetch(`/api/canvases/${canvas.id}`, {
+      const res = await apiFetch<{ version?: number }>(`/api/canvases/${canvas.id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, version: baseVersionRef.current }),
       });
+      if (typeof res.version === 'number') baseVersionRef.current = res.version;
       setIsDirty(false);
       onSaved({ id: canvas.id });
-    } catch {
-      // Non-fatal — dirty flag stays, user retries on next keystroke
+    } catch (err) {
+      if (err instanceof HttpError && err.status === 409) {
+        // Someone else saved first. Keep the user's text, stop autosaving.
+        if (unmountedRef.current) conflictDrafts.set(canvas.id, content);
+        else setConflictMine(content);
+      }
+      // Other errors are non-fatal — dirty flag stays, retried on next keystroke
     } finally {
       setSaving(false);
     }
-  }, [canvas.id, onSaved]);
+  };
+
+  async function fetchLatest(): Promise<CanvasFull | null> {
+    try {
+      return (await apiFetch<{ canvas: CanvasFull }>(`/api/canvases/${canvas.id}`)).canvas;
+    } catch {
+      return null;
+    }
+  }
+
+  async function handleConflictCopy() {
+    try { await navigator.clipboard.writeText(conflictMine ?? ''); } catch { /* clipboard denied */ }
+  }
+
+  async function handleConflictKeepMine() {
+    const mine = conflictMine;
+    const latest = await fetchLatest();
+    if (mine === null || !latest) return;
+    // Deliberate overwrite: rebase onto the latest version, then save our text.
+    baseVersionRef.current = latest.version ?? 0;
+    conflictRef.current = null;
+    setConflictMine(null);
+    await flushSave(mine);
+  }
+
+  async function handleConflictUseLatest() {
+    const latest = await fetchLatest();
+    if (!latest) return;
+    baseVersionRef.current = latest.version ?? 0;
+    setLocalContent(latest.content);
+    setIsDirty(false);
+    setConflictMine(null);
+  }
 
   function handleContentChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const value = e.target.value;
+    pendingContentRef.current = value;
     setLocalContent(value);
     setIsDirty(true);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
+      saveTimer.current = null;
       flushSave(value);
     }, 500);
   }
@@ -153,6 +247,7 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
     // Flush pending save before entering preview
     if (editMode && saveTimer.current) {
       clearTimeout(saveTimer.current);
+      saveTimer.current = null;
       flushSave(localContent);
     }
     setEditMode(m => !m);
@@ -226,6 +321,24 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
           </button>
         </div>
       </header>
+
+      {conflictMine !== null && (
+        <div className="cve-conflict" role="alert">
+          <p>
+            This canvas was changed somewhere else while you were editing, so your last edit was
+            not saved. Your text is kept here until you decide.
+          </p>
+          <details>
+            <summary>Your unsaved text</summary>
+            <textarea readOnly value={conflictMine} aria-label="Your unsaved text" />
+          </details>
+          <div className="cve-conflict-actions">
+            <button type="button" className="cve-btn" onClick={handleConflictCopy}>Copy my text</button>
+            <button type="button" className="cve-btn" onClick={handleConflictKeepMine}>Replace latest with mine</button>
+            <button type="button" className="cve-btn" onClick={handleConflictUseLatest}>Use latest, drop mine</button>
+          </div>
+        </div>
+      )}
 
       {/* Body */}
       <div className="cve-body">
@@ -521,6 +634,24 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
         }
 
         /* ── Save indicator ── */
+        .cve-conflict {
+          flex-shrink: 0;
+          padding: 0.625rem 0.875rem;
+          border-bottom: 1px solid rgba(201, 168, 124, 0.18);
+          background: rgba(201, 140, 90, 0.10);
+          font-size: 0.8125rem;
+        }
+        .cve-conflict p { margin: 0 0 0.5rem; }
+        .cve-conflict textarea {
+          width: 100%;
+          min-height: 6rem;
+          margin-top: 0.375rem;
+          font-family: var(--font-mono, monospace);
+          font-size: 0.75rem;
+        }
+        .cve-conflict-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+        .cve-conflict-actions .cve-btn { width: auto; height: auto; padding: 0.25rem 0.625rem; }
+
         .cve-save-indicator {
           position: absolute;
           bottom: 0.625rem;
@@ -652,6 +783,7 @@ export function CanvasView() {
       {/* Right: editor or empty state */}
       {activeCanvas && !loadingFull ? (
         <CanvasEditor
+          key={activeCanvas.id}
           canvas={activeCanvas}
           onSaved={handleSaved}
           onDeleted={handleDeleted}
