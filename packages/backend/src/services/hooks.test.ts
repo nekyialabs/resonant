@@ -36,15 +36,13 @@ vi.mock('./files.js', () => ({
 
 import { DESTRUCTIVE_BASH_PATTERNS, EMOTIONAL_MARKERS, getSafeWritePrefixes } from './hooks.js';
 
+// rm and the other tokenised checks are covered in bash-guard.test.ts.
 describe('DESTRUCTIVE_BASH_PATTERNS', () => {
   function matchesDestructive(command: string): boolean {
     return DESTRUCTIVE_BASH_PATTERNS.some(pattern => pattern.test(command));
   }
 
   describe('catches dangerous commands', () => {
-    it('rm -rf /', () => expect(matchesDestructive('rm -rf /')).toBe(true));
-    it('rm -rf ~', () => expect(matchesDestructive('rm -rf ~')).toBe(true));
-    it('rm -rf /home', () => expect(matchesDestructive('rm -rf /home')).toBe(true));
     it('FORMAT C:', () => expect(matchesDestructive('FORMAT C:')).toBe(true));
     it('DROP TABLE users', () => expect(matchesDestructive('DROP TABLE users')).toBe(true));
     it('DROP DATABASE prod', () => expect(matchesDestructive('DROP DATABASE prod')).toBe(true));
@@ -63,7 +61,6 @@ describe('DESTRUCTIVE_BASH_PATTERNS', () => {
     it('npm install', () => expect(matchesDestructive('npm install')).toBe(false));
     it('cat /etc/hosts', () => expect(matchesDestructive('cat /etc/hosts')).toBe(false));
     it('curl without pipe', () => expect(matchesDestructive('curl https://api.example.com')).toBe(false));
-    it('rm -rf ./node_modules', () => expect(matchesDestructive('rm -rf ./node_modules')).toBe(false));
     it('SELECT * FROM users', () => expect(matchesDestructive('SELECT * FROM users')).toBe(false));
   });
 });
