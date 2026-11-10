@@ -21,7 +21,8 @@ import { saveFile, saveFileFromBase64, saveFileInternal, getContentTypeFromMime 
 import { getResonantConfig, PROJECT_ROOT } from '../config.js';
 import crypto from 'crypto';
 import { existsSync, readFileSync, readdirSync } from 'fs';
-import { basename, join, resolve } from 'path';
+import { basename, join } from 'path';
+import { findDestructiveBash, isPathInsideRoots } from './bash-guard.js';
 
 // Re-export ConnectionRegistry type from types
 import type { ConnectionRegistry } from '../types.js';
@@ -57,20 +58,8 @@ export interface HookContext {
 // Constants
 // ---------------------------------------------------------------------------
 
-/** @internal Exported for testing */
-export const DESTRUCTIVE_BASH_PATTERNS = [
-  /rm\s+-rf\s+[\/~]/i,
-  /format\s+[a-z]:/i,
-  /DROP\s+TABLE/i,
-  /DROP\s+DATABASE/i,
-  /:\(\)\s*\{\s*:\|:\s*&\s*\}\s*;/,        // fork bomb
-  /git\s+push\s+.*--force.*\s+main/i,
-  /git\s+push\s+.*--force.*\s+master/i,
-  /curl\s+.*\|\s*bash/i,
-  /wget\s+.*\|\s*bash/i,
-  /mkfs\./i,
-  /dd\s+if=.*of=\/dev/i,
-];
+// Destructive-bash detection lives in ./bash-guard.ts (best-effort backstop, not a boundary).
+export { DESTRUCTIVE_BASH_PATTERNS } from './bash-guard.js';
 
 const IMAGE_GEN_TOOLS = new Set([
   'mcp__openai-image-gen__generate_image',
@@ -925,18 +914,20 @@ function buildPreToolUse(ctx: HookContext): HookCallback {
     // --- Security: Bash destructive patterns ---
     if (rawToolName === 'Bash' && toolInput?.command) {
       const cmd = String(toolInput.command);
-      for (const pattern of DESTRUCTIVE_BASH_PATTERNS) {
-        if (pattern.test(cmd)) {
-          console.warn(`[Hook] BLOCKED destructive bash: ${cmd.substring(0, 80)}`);
-          return {
-            continue: true,
-            hookSpecificOutput: {
-              hookEventName: 'PreToolUse' as const,
-              permissionDecision: 'deny' as const,
-              permissionDecisionReason: `Blocked: destructive command pattern detected (${pattern.source})`,
-            },
-          };
-        }
+      const reason = findDestructiveBash(cmd, {
+        roots: getSafeWritePrefixes(),
+        cwd: getResonantConfig().agent.cwd || null,
+      });
+      if (reason) {
+        console.warn(`[Hook] BLOCKED destructive bash: ${cmd.substring(0, 80)}`);
+        return {
+          continue: true,
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse' as const,
+            permissionDecision: 'deny' as const,
+            permissionDecisionReason: `Blocked: destructive command pattern detected (${reason})`,
+          },
+        };
       }
     }
 
@@ -945,19 +936,11 @@ function buildPreToolUse(ctx: HookContext): HookCallback {
       const filePath = String(toolInput.file_path);
       const safePrefixes = getSafeWritePrefixes();
       if (safePrefixes.length > 0) {
-        // Canonicalize for comparison: resolve('..'/'.') to collapse traversal,
-        // unify separators to '/', lowercase (Windows is case-insensitive). This
-        // mirrors the resolved-path containment in routes/api.ts isInsideBrowseRoot,
-        // and folds the fwd/bwd/lowercase prefix variants from getSafeWritePrefixes
-        // onto a single canonical form so legitimate in-root writes still pass.
-        const canon = (p: string) => resolve(p).replace(/\\/g, '/').toLowerCase();
-        const resolvedPath = canon(filePath);
-        const inWorkspace = safePrefixes.some(prefix => {
-          const root = canon(prefix);
-          if (resolvedPath === root) return true; // exact file-path prefix match
-          // Containment with separator guard so /foo doesn't match /foobar.
-          return resolvedPath.startsWith(root.endsWith('/') ? root : root + '/');
-        });
+        // Containment is checked on the real path: symlinks on the deepest
+        // existing ancestor are resolved (the target may not exist yet), and
+        // the roots are resolved too, then compared with a separator guard so
+        // /foo doesn't match /foobar. See bash-guard.ts isPathInsideRoots.
+        const inWorkspace = isPathInsideRoots(filePath, safePrefixes);
         if (!inWorkspace) {
           console.warn(`[Hook] BLOCKED file write outside workspace: ${filePath}`);
           return {
