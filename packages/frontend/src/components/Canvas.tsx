@@ -30,6 +30,7 @@ const BASE = import.meta.env.DEV ? 'http://127.0.0.1:3099' : '';
 
 interface CanvasFull extends CanvasMeta {
   content: string;
+  version?: number;
   language?: string;
 }
 
@@ -40,8 +41,12 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw new HttpError(res.status, `${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
+}
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
 }
 
 // ─── SVGs ──────────────────────────────────────────────────────────────────────
@@ -89,6 +94,13 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
   const [editMode, setEditMode] = useState(true);
   const [saving, setSaving] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Version this edit session is based on (sent with every save so a save made
+  // after someone else changed the canvas is refused instead of overwriting).
+  const baseVersionRef = useRef(canvas.version ?? 0);
+  // Unsaved text kept after a refused save; autosave is paused while set.
+  const [conflictMine, setConflictMine] = useState<string | null>(null);
+  const conflictRef = useRef<string | null>(null);
+  conflictRef.current = conflictMine;
 
   // When canvas id changes, sync from fresh fetch result
   useEffect(() => {
@@ -96,6 +108,8 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
     setLocalContent(canvas.content);
     setIsDirty(false);
     setEditMode(true);
+    baseVersionRef.current = canvas.version ?? 0;
+    setConflictMine(null);
   }, [canvas.id]);
 
   // If parent refreshes the canvas record (not an id switch), pull non-dirty fields
@@ -108,20 +122,58 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
   }, [canvas.title, canvas.content]);
 
   const flushSave = useCallback(async (content: string) => {
+    if (conflictRef.current !== null) return;
     setSaving(true);
     try {
-      await apiFetch(`/api/canvases/${canvas.id}`, {
+      const res = await apiFetch<{ version?: number }>(`/api/canvases/${canvas.id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, version: baseVersionRef.current }),
       });
+      if (typeof res.version === 'number') baseVersionRef.current = res.version;
       setIsDirty(false);
       onSaved({ id: canvas.id });
-    } catch {
-      // Non-fatal — dirty flag stays, user retries on next keystroke
+    } catch (err) {
+      if (err instanceof HttpError && err.status === 409) {
+        // Someone else saved first. Keep the user's text, stop autosaving.
+        setConflictMine(content);
+      }
+      // Other errors are non-fatal — dirty flag stays, retried on next keystroke
     } finally {
       setSaving(false);
     }
   }, [canvas.id, onSaved]);
+
+  async function fetchLatest(): Promise<CanvasFull | null> {
+    try {
+      return (await apiFetch<{ canvas: CanvasFull }>(`/api/canvases/${canvas.id}`)).canvas;
+    } catch {
+      return null;
+    }
+  }
+
+  async function handleConflictCopy() {
+    try { await navigator.clipboard.writeText(conflictMine ?? ''); } catch { /* clipboard denied */ }
+  }
+
+  async function handleConflictKeepMine() {
+    const mine = conflictMine;
+    const latest = await fetchLatest();
+    if (mine === null || !latest) return;
+    // Deliberate overwrite: rebase onto the latest version, then save our text.
+    baseVersionRef.current = latest.version ?? 0;
+    conflictRef.current = null;
+    setConflictMine(null);
+    await flushSave(mine);
+  }
+
+  async function handleConflictUseLatest() {
+    const latest = await fetchLatest();
+    if (!latest) return;
+    baseVersionRef.current = latest.version ?? 0;
+    setLocalContent(latest.content);
+    setIsDirty(false);
+    setConflictMine(null);
+  }
 
   function handleContentChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const value = e.target.value;
@@ -226,6 +278,24 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
           </button>
         </div>
       </header>
+
+      {conflictMine !== null && (
+        <div className="cve-conflict" role="alert">
+          <p>
+            This canvas was changed somewhere else while you were editing, so your last edit was
+            not saved. Your text is kept here until you decide.
+          </p>
+          <details>
+            <summary>Your unsaved text</summary>
+            <textarea readOnly value={conflictMine} aria-label="Your unsaved text" />
+          </details>
+          <div className="cve-conflict-actions">
+            <button type="button" className="cve-btn" onClick={handleConflictCopy}>Copy my text</button>
+            <button type="button" className="cve-btn" onClick={handleConflictKeepMine}>Replace latest with mine</button>
+            <button type="button" className="cve-btn" onClick={handleConflictUseLatest}>Use latest, drop mine</button>
+          </div>
+        </div>
+      )}
 
       {/* Body */}
       <div className="cve-body">
@@ -521,6 +591,24 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
         }
 
         /* ── Save indicator ── */
+        .cve-conflict {
+          flex-shrink: 0;
+          padding: 0.625rem 0.875rem;
+          border-bottom: 1px solid rgba(201, 168, 124, 0.18);
+          background: rgba(201, 140, 90, 0.10);
+          font-size: 0.8125rem;
+        }
+        .cve-conflict p { margin: 0 0 0.5rem; }
+        .cve-conflict textarea {
+          width: 100%;
+          min-height: 6rem;
+          margin-top: 0.375rem;
+          font-family: var(--font-mono, monospace);
+          font-size: 0.75rem;
+        }
+        .cve-conflict-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+        .cve-conflict-actions .cve-btn { width: auto; height: auto; padding: 0.25rem 0.625rem; }
+
         .cve-save-indicator {
           position: absolute;
           bottom: 0.625rem;

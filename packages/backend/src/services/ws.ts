@@ -1014,7 +1014,20 @@ function handleCanvasUpdate(
   }
 
   const now = new Date().toISOString();
-  updateCanvasContent(msg.canvasId, msg.content, now);
+  // baseVersion is the version the client loaded. Absent = legacy client,
+  // unconditional write (still bumps the version).
+  const result = updateCanvasContent(msg.canvasId, msg.content, now, msg.baseVersion);
+  if (!result.ok) {
+    if (result.reason === 'not_found') {
+      sendError(ws, 'canvas_not_found', 'Canvas not found');
+    } else {
+      // Stale write refused. Hand the sender the current canvas so it can
+      // reload without losing the text it tried to save.
+      const conflict: ServerMessage = { type: 'canvas_conflict', canvasId: msg.canvasId, canvas: result.canvas };
+      ws.send(JSON.stringify(conflict));
+    }
+    return;
+  }
 
   // Broadcast to everyone except the sender (avoids cursor jump)
   registry.broadcastExcept(ws, {
@@ -1022,7 +1035,11 @@ function handleCanvasUpdate(
     canvasId: msg.canvasId,
     content: msg.content,
     updatedAt: now,
+    version: result.version,
   });
+  // The sender learns its new version so its next save is not seen as stale.
+  const saved: ServerMessage = { type: 'canvas_saved', canvasId: msg.canvasId, version: result.version };
+  ws.send(JSON.stringify(saved));
 }
 
 function handleCanvasUpdateTitle(

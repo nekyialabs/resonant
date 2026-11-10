@@ -382,7 +382,7 @@ router.post('/internal/telegram-send', internalOnly, async (req, res) => {
 router.post('/internal/canvas', internalOnly, (req, res) => {
 
   const config = getResonantConfig();
-  const { action, canvasId, title, content, filePath, contentType, language, threadId } = req.body;
+  const { action, canvasId, title, content, filePath, contentType, language, threadId, baseVersion } = req.body;
   const now = new Date().toISOString();
 
   // Resolve content: filePath takes priority over inline content
@@ -450,17 +450,52 @@ router.post('/internal/canvas', internalOnly, (req, res) => {
         canvas,
         ...(threadId ? {} : { note: 'no thread — library only' }),
       });
+    } else if (action === 'read') {
+      // Lets the agent fetch the current content AND version before a
+      // versioned update (res canvas read → res canvas update --base-version).
+      const existing = canvasId ? getCanvas(canvasId) : null;
+      if (!existing) {
+        res.status(404).json({ error: 'Canvas not found' });
+        return;
+      }
+      res.json({ success: true, canvas: existing });
     } else if (action === 'update') {
       if (!canvasId || (resolvedContent === '' && !filePath)) {
         res.status(400).json({ error: 'canvasId and content (or filePath) are required' });
         return;
       }
-      updateCanvasContent(canvasId, resolvedContent, now);
-      registry.broadcast({ type: 'canvas_updated', canvasId, content: resolvedContent, updatedAt: now });
+      if (baseVersion !== undefined && !Number.isInteger(baseVersion)) {
+        res.status(400).json({ error: 'baseVersion must be an integer' });
+        return;
+      }
+      // This is a full-content write, so a "retry on top of latest" would
+      // still clobber whoever won the race. With a baseVersion we refuse a
+      // stale write and tell the agent to re-read; without one (legacy
+      // callers) the write is last-write-wins, as before, but still bumps the
+      // version so a stale human editor is refused instead of being clobbered.
+      const result = updateCanvasContent(canvasId, resolvedContent, now, baseVersion);
+      if (!result.ok) {
+        if (result.reason === 'not_found') {
+          res.status(404).json({ error: 'Canvas not found' });
+        } else {
+          res.status(409).json({
+            error:
+              `Canvas changed since you read it (you had version ${baseVersion}, it is now ${result.canvas.version}). ` +
+              'Nothing was written. Re-read it with "canvas read", merge your changes into the latest content, and update again with the new --base-version.',
+            canvas: result.canvas,
+          });
+        }
+        return;
+      }
+      registry.broadcast({ type: 'canvas_updated', canvasId, content: resolvedContent, updatedAt: now, version: result.version });
       logCompanionAction('canvas', 'updated a canvas');
-      res.json({ success: true });
+      res.json({
+        success: true,
+        version: result.version,
+        ...(baseVersion === undefined ? { note: 'no baseVersion — unconditional write; use "canvas read" first to guard against concurrent edits' } : {}),
+      });
     } else {
-      res.status(400).json({ error: 'Unknown action. Use "create" or "update".' });
+      res.status(400).json({ error: 'Unknown action. Use "create", "read" or "update".' });
     }
   } catch (error) {
     console.error('Internal canvas error:', error);
@@ -3543,17 +3578,34 @@ router.patch('/canvases/:id', (req, res) => {
     }
 
     const now = new Date().toISOString();
-    const { title, content } = req.body;
+    const { title, content, version } = req.body;
 
+    if (version !== undefined && !Number.isInteger(version)) {
+      res.status(400).json({ error: 'version must be an integer' });
+      return;
+    }
+
+    // Content first: on a stale version nothing is written (title included).
+    // A request with no version is a legacy caller: unconditional write.
+    let newVersion = canvas.version;
+    if (content !== undefined) {
+      const result = updateCanvasContent(req.params.id, content, now, version);
+      if (!result.ok) {
+        if (result.reason === 'not_found') {
+          res.status(404).json({ error: 'Canvas not found' });
+        } else {
+          res.status(409).json({ error: 'Canvas was changed by someone else', canvas: result.canvas });
+        }
+        return;
+      }
+      newVersion = result.version;
+      registry.broadcast({ type: 'canvas_updated', canvasId: req.params.id, content, updatedAt: now, version: newVersion });
+    }
     if (title !== undefined) {
       updateCanvasTitle(req.params.id, title, now);
     }
-    if (content !== undefined) {
-      updateCanvasContent(req.params.id, content, now);
-      registry.broadcast({ type: 'canvas_updated', canvasId: req.params.id, content, updatedAt: now });
-    }
 
-    res.json({ success: true });
+    res.json({ success: true, version: newVersion });
   } catch (error) {
     console.error('Error updating canvas:', error);
     res.status(500).json({ error: 'Failed to update canvas' });
