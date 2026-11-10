@@ -219,6 +219,7 @@ const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 function stripPrefixes(words: string[]): string[] {
   const w = words.slice();
+  const replStrings: string[] = []; // xargs replace-strings: filled from stdin, so unknown
   for (let guard = 0; guard < 30 && w.length; guard++) {
     if (ASSIGN.test(w[0])) { w.shift(); continue; }
     if (KEYWORDS.has(w[0])) { w.shift(); continue; }
@@ -241,6 +242,13 @@ function stripPrefixes(words: string[]): string[] {
       while (w.length && w[0].startsWith('-')) {
         const opt = w.shift()!;
         if (opt === '--') break;
+        if (base === 'xargs') {
+          if (opt === '-I') replStrings.push(w[0] ?? '');
+          else if (opt.startsWith('-I') && opt.length > 2) replStrings.push(opt.slice(2));
+          else if (opt === '-i' || opt === '--replace') replStrings.push('{}');
+          else if (opt.startsWith('-i') && opt.length > 2) replStrings.push(opt.slice(2));
+          else if (opt.startsWith('--replace=')) replStrings.push(opt.slice(10));
+        }
         if (WRAPPER_ARG_OPTS[base]?.includes(opt)) w.shift();
       }
       while (w.length && /^\d+(\.\d+)?[smhd]?$/.test(w[0])) w.shift(); // timeout DURATION
@@ -248,10 +256,11 @@ function stripPrefixes(words: string[]): string[] {
     }
     break;
   }
+  if (replStrings.length) return w.map(x => (replStrings.includes(x) ? SUBST : x));
   return w;
 }
 
-function checkRm(args: string[], ctx: GuardContext): string | null {
+function checkRm(args: string[], ctx: GuardContext, execSafe = false): string | null {
   let recursive = false;
   let endOpts = false;
   const targets: string[] = [];
@@ -271,6 +280,9 @@ function checkRm(args: string[], ctx: GuardContext): string | null {
   if (!recursive) return null;
   // Targets we can't see (stdin via xargs, or all hidden behind a substitution): fail closed.
   if (targets.length === 0) return 'recursive rm with no visible target';
+  // `{}` is filled from stdin (xargs) or find's results. Under find -exec the
+  // find-root check decides; anywhere else it is an unknown target.
+  if (!execSafe && targets.includes('{}')) return 'recursive rm of {} (filled from stdin)';
   for (const t of targets) {
     if (isDangerousTarget(t, ctx, { strictAbs: true })) return `recursive rm of ${t}`;
   }
@@ -283,7 +295,7 @@ function checkFind(args: string[], ctx: GuardContext, depth: number): string | n
   const execIdx = args.findIndex(a => /^-(exec|execdir|ok|okdir)$/.test(a));
   const execCmd = execIdx >= 0 ? basename(args[execIdx + 1] ?? '').toLowerCase() : '';
   if (execIdx >= 0) {
-    const inner = analyseSegment(args.slice(execIdx + 1).filter(a => a !== '\\'), ctx, depth + 1);
+    const inner = analyseSegment(args.slice(execIdx + 1).filter(a => a !== '\\'), ctx, depth + 1, true);
     if (inner) return `find -exec: ${inner}`;
   }
   const deletes = args.includes('-delete') || ['rm', 'unlink', 'shred', 'rmdir'].includes(execCmd);
@@ -363,7 +375,7 @@ function checkInterpreter(args: string[], ctx: GuardContext, depth: number): str
   return null;
 }
 
-function analyseSegment(words: string[], ctx: GuardContext, depth: number): string | null {
+function analyseSegment(words: string[], ctx: GuardContext, depth: number, execSafe = false): string | null {
   const w = stripPrefixes(words);
   if (!w.length) return null;
   const cmd = basename(w[0].replace(/^\\/, '')).toLowerCase().replace(/\.exe$/, '');
@@ -380,7 +392,7 @@ function analyseSegment(words: string[], ctx: GuardContext, depth: number): stri
     return checkWinDelete(cmd, args, ctx);
   }
   if (cmd === 'eval') return findDestructiveInner(args.join(' '), ctx, depth + 1);
-  if (cmd === 'rm') return checkRm(args, ctx);
+  if (cmd === 'rm') return checkRm(args, ctx, execSafe);
   if (cmd === 'find') return checkFind(args, ctx, depth);
   if (cmd === 'truncate') return checkTruncate(args);
   if (cmd === 'shred') return 'shred';

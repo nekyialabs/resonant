@@ -64,6 +64,9 @@ describe('findDestructiveBash: round 2 (keywords, fail-closed, wrappers, Windows
     '{ rm -rf /; }', '! rm -rf /', 'if true; then rm -rf /; fi', 'if false; then ls; else rm -rf /; fi', 'time rm -rf /',
     // 2. stdin-fed recursive deletes
     'find . -name x | xargs rm -rf', 'echo / | xargs rm -r', 'xargs rm -rf', 'cat list | xargs -0 rm -R',
+    // 3b. {} and xargs replace-strings are filled from stdin
+    'xargs -I{} rm -r {}', 'xargs -I X rm -rf X', 'xargs -I{} sh -c "echo" ; xargs -I % rm -r %', 'xargs --replace=Z rm -rf Z', 'xargs -i rm -r {}',
+    `ls | xargs -I{} rm -rf {}`, `find / -exec rm -r {} \;`, `find .. -name x -exec rm -rf {} +`, 'rm -rf {}',
     // 3. substitution in targets
     'rm -rf $(pwd)', 'rm -rf `pwd`', 'rm -rf "$(echo /)"', 'rm -r $(ls)', 'rm -rf ./$(echo x)',
     // 4. wrapper option arguments
@@ -85,6 +88,8 @@ describe('findDestructiveBash: round 2 (keywords, fail-closed, wrappers, Windows
 
   const ok = [
     // 8. the shell-pipe pattern must not match hashing tools
+    // find -exec with a safe relative root keeps working
+    `find build -exec rm -r {} \;`, `find src -type d -exec rm -rf {} +`, 'xargs -I{} rm {}',
     'curl https://example.com/x.tar.gz | sha256sum', 'curl -sL https://example.com/x | shasum -a 256', 'wget -qO- https://example.com/x | sha1sum',
     // ordinary uses of the same machinery
     'ls *.tmp | xargs rm', 'xargs -I X rm X', 'timeout 5 rm file', 'for f in a b; do echo "$f"; done', 'for f in a; do rm "$f"; done',
