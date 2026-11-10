@@ -135,6 +135,10 @@ interface ChatStore {
 
   // Canvas panel
   threadCanvases: Canvas[];
+  /** Unsaved text whose save was refused as stale after its editor had already
+   *  closed. Reopening that canvas shows it in the conflict notice. */
+  canvasDrafts: Record<string, string>;
+  setCanvasDraft: (id: string, text: string | null) => void;
   openCanvasId: string | null;
 
   // Context usage (from context_usage server events)
@@ -1373,6 +1377,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
     transcription: { status: 'idle', text: null, error: null },
 
     threadCanvases: [],
+    canvasDrafts: {},
+    setCanvasDraft: (id, text) => set(s => {
+      const next = { ...s.canvasDrafts };
+      if (text === null) delete next[id]; else next[id] = text;
+      return { canvasDrafts: next };
+    }),
     openCanvasId: null,
 
     contextUsage: null,

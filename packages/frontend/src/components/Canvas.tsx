@@ -78,6 +78,10 @@ function IconTrash() {
   );
 }
 
+// Text whose save was refused as stale after its editor had already closed.
+// Reopening that canvas shows it in the conflict notice instead of losing it.
+const conflictDrafts = new Map<string, string>();
+
 // ─── CanvasEditor ──────────────────────────────────────────────────────────────
 
 interface CanvasEditorProps {
@@ -98,8 +102,14 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
   // after someone else changed the canvas is refused instead of overwriting).
   const baseVersionRef = useRef(canvas.version ?? 0);
   // Unsaved text kept after a refused save; autosave is paused while set.
-  const [conflictMine, setConflictMine] = useState<string | null>(null);
+  const [conflictMine, setConflictMine] = useState<string | null>(() => {
+    const draft = conflictDrafts.get(canvas.id);
+    conflictDrafts.delete(canvas.id);
+    return draft ?? null;
+  });
   const conflictRef = useRef<string | null>(null);
+  const unmountedRef = useRef(false);
+  const pendingContentRef = useRef<string | null>(null);
   conflictRef.current = conflictMine;
 
   // When canvas id changes, sync from fresh fetch result
@@ -127,15 +137,28 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
 
   // The editor is keyed on canvas.id, so a timer left over from this canvas can
   // never fire against another one.
+  // On leaving, a pending save is flushed (same chain, this instance's id and
+  // base version) rather than dropped; a refused one is kept as a draft.
   useEffect(() => () => {
-    if (saveTimer.current) clearTimeout(saveTimer.current);
+    unmountedRef.current = true;
+    if (conflictRef.current !== null) {
+      conflictDrafts.set(canvas.id, conflictRef.current);
+    } else if (saveTimer.current && pendingContentRef.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+      void flushSaveRef.current(pendingContentRef.current);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const flushSaveRef = useRef<(c: string) => Promise<void>>(async () => {});
   function flushSave(content: string): Promise<void> {
     const run = saveChain.current.then(() => doSave(content));
     saveChain.current = run.catch(() => undefined);
     return run;
   }
+
+  flushSaveRef.current = flushSave;
 
   const doSave = async (content: string): Promise<void> => {
     if (conflictRef.current !== null) return;
@@ -151,7 +174,8 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
     } catch (err) {
       if (err instanceof HttpError && err.status === 409) {
         // Someone else saved first. Keep the user's text, stop autosaving.
-        setConflictMine(content);
+        if (unmountedRef.current) conflictDrafts.set(canvas.id, content);
+        else setConflictMine(content);
       }
       // Other errors are non-fatal — dirty flag stays, retried on next keystroke
     } finally {
@@ -193,6 +217,7 @@ function CanvasEditor({ canvas, onSaved, onDeleted }: CanvasEditorProps) {
 
   function handleContentChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const value = e.target.value;
+    pendingContentRef.current = value;
     setLocalContent(value);
     setIsDirty(true);
     if (saveTimer.current) clearTimeout(saveTimer.current);
