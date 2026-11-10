@@ -261,7 +261,8 @@ The web UI (React) talks over HTTP + a WebSocket to a Node/Express backend, whic
 
 - **Local-first.** Your conversations, memory, and your AI's identity live in a SQLite file on your machine.
 - **Fail-closed auth.** An empty password *refuses to serve* rather than opening up.
-- **Write-gate.** The agent's filesystem writes are restricted to folders you configure — it can't wander your disk.
+- **Write-gate.** The agent's filesystem writes are restricted to folders you configure — it can't wander your disk. Paths are checked after resolving symlinks, so a link inside an allowed folder can't lead out of it. This is the real boundary for file writes.
+- **Bash guard (best-effort).** The agent's Bash tool refuses a set of obviously destructive commands (recursive `rm` of `/`, `~` or the workspace root, `find -delete`, `mkfs`, `dd` to a device, and similar). It is a backstop against accidents and runaway loops, **not** a security boundary: shell is free-form and a determined command can always get around a pattern list. Don't rely on it to contain an untrusted agent.
 - **Bring your own keys.** Credentials stay in your gitignored `.env` (or the local database); nothing phones home.
 - **Loopback-only internals.** The internal routes the agent and `res` CLI use are protected by an auto-generated local token and bound to localhost.
 

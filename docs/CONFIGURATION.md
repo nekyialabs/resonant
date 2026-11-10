@@ -299,6 +299,10 @@ falls back to the default shown.
 > The agent can always write inside its own home (`agent.cwd`). These keys grant
 > access to *additional* places — a notes vault, a project folder — without
 > opening up your whole disk.
+>
+> The write-gate is the real boundary for file writes (symlinks are resolved
+> before the check). The separate Bash guard that blocks commands like
+> `rm -rf /` is a best-effort backstop against accidents, not a security boundary.
 
 ### `voice` — spoken audio
 
